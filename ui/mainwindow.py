@@ -3,12 +3,16 @@ import queue
 import webbrowser
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
-                             QLineEdit, QFileDialog, QMessageBox, QHeaderView, QApplication)
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+                             QLineEdit, QFileDialog, QMessageBox, QHeaderView, QApplication,
+                             QMenu)
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QEvent
+from PyQt6.QtGui import QColor
 from core.engine import TorrentEngine
 from core.scanner import PreDownloadScanner
 from core.config import cfg, DOWNLOADS_DIR
 from core.lt_compat import has_metadata, torrent_info_of, torrent_name
+from core.risk import (LEVEL_COLORS, LEVEL_LABELS, parse_verdict, summary_of,
+                       worst)
 from ai.opencode_guard import OpenCodeGuard
 from ui.search_plugins_tab import SearchPluginsTab
 from ui.search_tab import SearchTab
@@ -19,12 +23,12 @@ from core.firewall import TorrentFirewall
 class AiWorker(QThread):
     """Fila de analises com o OpenCode (uma por vez, fora da thread da UI)."""
 
-    #: (nome do torrent, parecer)
-    result = pyqtSignal(str, str)
-    #: (nome do torrent, mensagem de erro)
-    failed = pyqtSignal(str, str)
-    #: (nome do torrent, quantidade na fila)
-    started = pyqtSignal(str, int)
+    #: (info hash, nome do torrent, parecer)
+    result = pyqtSignal(str, str, str)
+    #: (info hash, nome do torrent, mensagem de erro)
+    failed = pyqtSignal(str, str, str)
+    #: (info hash, nome do torrent, quantidade na fila)
+    started = pyqtSignal(str, str, int)
 
     def __init__(self, guard, parent=None):
         super().__init__(parent)
@@ -33,9 +37,9 @@ class AiWorker(QThread):
         self._stop = False
 
     # ------------------------------------------------------------------
-    def submit(self, name, files, report=None):
+    def submit(self, ih, name, files, report=None):
         """Enfileira uma analise."""
-        self._queue.put((name, files, report))
+        self._queue.put((ih, name, files, report))
         if not self.isRunning():
             self.start()
 
@@ -61,20 +65,20 @@ class AiWorker(QThread):
     def run(self):
         while not self._stop:
             try:
-                name, files, report = self._queue.get(timeout=0.4)
+                ih, name, files, report = self._queue.get(timeout=0.4)
             except queue.Empty:
                 continue
-            self.started.emit(name, self._queue.qsize())
+            self.started.emit(ih, name, self._queue.qsize())
             try:
                 res = self.guard.analyze_torrent(name, files, report)
             except Exception as exc:
-                self.failed.emit(name, str(exc))
+                self.failed.emit(ih, name, str(exc))
                 continue
             if not res or not res.strip():
                 res = ("Sem resposta do OpenCode.\n\n"
                        "Verifique se o CLI esta instalado e autenticado:\n"
                        "/usr/lib/opencode-desktop/opencode-cli run --model opencode/big-pickle \"teste\"")
-            self.result.emit(name, res)
+            self.result.emit(ih, name, res)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -100,6 +104,11 @@ class MainWindow(QMainWindow):
             app.aboutToQuit.connect(self.shutdown_worker)
         self.fw = TorrentFirewall()
         self.pending = {}
+        #: nivel de risco por torrent (info hash)
+        self.risk = {}
+        #: torrents que ja geraram aviso na tela
+        self._warned = set()
+        self._row_map = {}
         self.setup_ui()
         self.timer = QTimer(); self.timer.timeout.connect(self.refresh); self.timer.start(1000)
 
@@ -118,16 +127,23 @@ class MainWindow(QMainWindow):
         self.btn_add_file.clicked.connect(self.add_file)
         self.btn_start.clicked.connect(self.start_sel)
         self.btn_pause.clicked.connect(self.pause_sel)
-        self.btn_remove.clicked.connect(self.remove_sel)
+        self.btn_remove.clicked.connect(lambda: self.remove_sel(False))
         self.btn_fw.clicked.connect(self.toggle_fw)
         top.addWidget(self.magnet); top.addWidget(self.btn_add_magnet); top.addWidget(self.btn_add_file)
         top.addWidget(self.btn_start); top.addWidget(self.btn_pause); top.addWidget(self.btn_remove); top.addWidget(self.btn_fw)
         layout.addLayout(top)
 
         self.tabs = QTabWidget()
-        self.tbl = QTableWidget(0,6)
-        self.tbl.setHorizontalHeaderLabels(["Nome","Tamanho","Status","Progresso","Vel.Up","Vel.Down"])
+        self.tbl = QTableWidget(0,7)
+        self.tbl.setHorizontalHeaderLabels(["Nome","Tamanho","Status","Progresso","Vel.Up","Vel.Down","Risco"])
         self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.tbl.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tbl.customContextMenuRequested.connect(self.show_context_menu)
+        self.tbl.installEventFilter(self)
         self.tabs.addTab(self.tbl,"Torrents")
 
         sec = QWidget(); sv=QVBoxLayout(sec)
@@ -192,9 +208,10 @@ class MainWindow(QMainWindow):
             rep = self.scanner.analyze_info(info)
             self.pending[ih] = {'handle':h,'type':'file','info':info,'report':rep}
             self.show_report(rep)
+            self.register_risk(ih, rep['risk'], rep['reasons'], source='scanner')
             self.logmsg("Arquivo carregado pausado")
             self.logmsg(f"Analise pre-download concluida: risco {rep['risk']} ({len(rep['files'])} arquivos)")
-            self.ai_scan(torrent_name(h, info), rep['files'], rep)
+            self.ai_scan(ih, torrent_name(h, info), rep['files'], rep)
         except Exception as e:
             QMessageBox.critical(self,'Erro',str(e))
 
@@ -216,8 +233,9 @@ class MainWindow(QMainWindow):
                 return
             self.pending[ih]['info']=info; self.pending[ih]['report']=rep
             self.show_report(rep)
+            self.register_risk(ih, rep['risk'], rep['reasons'], source='scanner')
             self.logmsg(f"Analise pre-download concluida: risco {rep['risk']} ({len(rep['files'])} arquivos)")
-            self.ai_scan(torrent_name(h, info), rep['files'], rep)
+            self.ai_scan(ih, torrent_name(h, info), rep['files'], rep)
         except Exception as e:
             self.logmsg(f"Falha ao analisar torrent: {e}")
             self.show_report_error(str(e))
@@ -232,26 +250,96 @@ class MainWindow(QMainWindow):
     def show_report_error(self, message):
         self.sec_info.setText(f"Falha na analise pre-download:\n{message}")
 
-    def ai_scan(self,name,files,report=None):
+    # ------------------------------------------------------------------
+    # risco
+    # ------------------------------------------------------------------
+    def register_risk(self, ih, level, reasons, source='scanner'):
+        """Guarda (e combina) o nivel de risco de um torrent."""
+        current = self.risk.get(ih) or {'level': 'LOW', 'reasons': [], 'source': ''}
+        new_level = worst(current['level'], level)
+        merged = list(current.get('reasons') or [])
+        for reason in reasons or []:
+            if reason not in merged:
+                merged.append(reason)
+        self.risk[ih] = {'level': new_level, 'reasons': merged, 'source': source}
+        if new_level in ("MEDIUM", "HIGH"):
+            self.logmsg(f"Risco {LEVEL_LABELS[new_level]}: {ih[:12]} ({source}) - "
+                        + "; ".join(merged[:4]))
+        return new_level
+
+    def risk_level(self, ih):
+        entry = self.risk.get(ih)
+        return entry['level'] if entry else 'LOW'
+
+    def confirm_start(self, ih):
+        """Pede confirmacao antes de baixar um arquivo de risco."""
+        entry = self.risk.get(ih)
+        if not entry or entry['level'] == 'LOW':
+            return True
+
+        h = self.engine.torrents.get(ih) if self.engine else None
+        nome = torrent_name(h) if h is not None else ih[:16]
+        report = (self.pending.get(ih) or {}).get('report')
+        details = summary_of(report)
+        motivos = "\n".join(f"- {r}" for r in (entry.get('reasons') or []))
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Arquivo suspeito - risco " + LEVEL_LABELS[entry['level']])
+        box.setText(f"'{nome}' foi classificado com risco "
+                    f"{LEVEL_LABELS[entry['level']]}.\nDeseja baixar mesmo assim?")
+        box.setInformativeText(motivos or "Nenhum motivo detalhado disponivel.")
+        if details:
+            box.setDetailedText(details)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            self.logmsg(f"Usuario confirmou o download de um arquivo de risco: {nome}")
+            return True
+        self.logmsg(f"Download cancelado pelo usuario (risco): {nome}")
+        return False
+
+    def warn_risk(self, ih, name, text):
+        """Aviso na tela assim que a analise aponta risco alto."""
+        if ih in self._warned:
+            return
+        self._warned.add(ih)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("Alerta de segurança")
+        box.setText(f"A analise classificou '{name}' como PERIGOSO.\n"
+                    f"Nao inicie o download sem ler o parecer.")
+        box.setDetailedText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+
+    def ai_scan(self, ih, name, files, report=None):
         self.tabs.setCurrentIndex(1)
         if not files:
             self.sec_ai.setText("Nenhum arquivo para analisar.")
             return
         self.sec_ai.setText(f"Consultando OpenCode...\n\nTorrent: {name}\nArquivos: {len(files)}\nAguarde, isso pode levar alguns segundos.")
         self.sec_ai.repaint()
-        self.ai_worker.submit(name, files, report)
+        self.ai_worker.submit(ih, name, files, report)
 
-    def on_ai_started(self, name, waiting):
+    def on_ai_started(self, ih, name, waiting):
         self.logmsg(f"Analisando com OpenCode: {name}" + (f" ({waiting} na fila)" if waiting else ""))
         if waiting:
             self.sec_ai.setText(f"Consultando OpenCode...\n\nTorrent: {name}\n"
                                 f"{waiting} analise(s) na fila. Aguarde...")
 
-    def on_ai_result(self, name, text):
+    def on_ai_result(self, ih, name, text):
         self.sec_ai.setText(f"{text}\n\n--- Analisado: {name} ---")
         self.logmsg(f"Parecer do OpenCode recebido para: {name}")
+        level, recommendation = parse_verdict(text)
+        if level:
+            self.register_risk(ih, level, [f"OpenCode: {recommendation}" if recommendation
+                                           else f"OpenCode classificou como {level}"],
+                               source='opencode')
+            if level == "HIGH":
+                self.warn_risk(ih, name, text)
 
-    def on_ai_failed(self, name, message):
+    def on_ai_failed(self, ih, name, message):
         self.sec_ai.setText(f"Erro ao chamar OpenCode:\n{message}")
         self.logmsg(f"Erro na analise OpenCode ({name}): {message}")
 
@@ -271,50 +359,168 @@ class MainWindow(QMainWindow):
         self.shutdown_worker()
         super().closeEvent(event)
 
+    def current_ih(self):
+        """Info hash do torrent selecionado (ou None)."""
+        row = self.tbl.currentRow()
+        if row < 0:
+            return None
+        item = self.tbl.item(row, 0)
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
     def start_sel(self):
         if not self.engine: return
-        r = self.tbl.currentRow()
-        if r<0: return
-        ih = self.tbl.item(r,0).data(Qt.ItemDataRole.UserRole)
-        if ih in self.pending and self.pending[ih].get('report'):
-            rep = self.pending[ih]['report']
-            if rep['risk']=='HIGH':
-                if QMessageBox.question(self,'ALTO RISCO','Classificado como ALTO RISCO.\nIniciar mesmo assim?') != QMessageBox.StandardButton.Yes: return
+        ih = self.current_ih()
+        if not ih:
+            self.logmsg("Selecione um torrent na lista")
+            return
+        if not self.confirm_start(ih):
+            return
         self.engine.resume(ih); self.logmsg('Iniciado')
 
     def pause_sel(self):
         if not self.engine: return
-        r=self.tbl.currentRow()
-        if r<0:return
-        ih=self.tbl.item(r,0).data(Qt.ItemDataRole.UserRole)
+        ih = self.current_ih()
+        if not ih:
+            self.logmsg("Selecione um torrent na lista")
+            return
         self.engine.pause(ih); self.logmsg('Pausado')
 
-    def remove_sel(self):
+    def remove_sel(self, delete_files=False):
         if not self.engine: return
-        r=self.tbl.currentRow()
-        if r<0:return
-        ih=self.tbl.item(r,0).data(Qt.ItemDataRole.UserRole)
-        self.engine.remove(ih); self.pending.pop(ih,None); self.tbl.removeRow(r)
+        ih = self.current_ih()
+        if not ih:
+            self.logmsg("Selecione um torrent na lista")
+            return
+        h = self.engine.torrents.get(ih)
+        nome = torrent_name(h) if h is not None else ih[:16]
+        if delete_files:
+            resp = QMessageBox.question(
+                self, 'Remover e apagar',
+                f"Remover '{nome}' e APAGAR os arquivos baixados do disco?")
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+        ok = self.engine.remove(ih, delete_files=delete_files)
+        self.pending.pop(ih, None)
+        self.risk.pop(ih, None)
+        self._warned.discard(ih)
+        if ok:
+            self.logmsg(f"Removido e arquivos apagados: {nome}" if delete_files
+                        else f"Removido (arquivos mantidos): {nome}")
+        else:
+            self.logmsg("Falha ao remover o torrent")
+        # limpa a linha na hora, sem esperar o proximo refresh
+        row = self.tbl.currentRow()
+        if row >= 0:
+            self.tbl.removeRow(row)
+        self.tbl.clearSelection()
+
+    def show_context_menu(self, pos):
+        row = self.tbl.rowAt(pos.y())
+        if row < 0:
+            return
+        self.tbl.selectRow(row)
+        menu = QMenu(self)
+        menu.addAction("Iniciar", self.start_sel)
+        menu.addAction("Pausar", self.pause_sel)
+        menu.addSeparator()
+        menu.addAction("Remover (manter arquivos)", self.remove_sel)
+        menu.addAction("Remover e apagar arquivos", lambda: self.remove_sel(True))
+        menu.exec(self.tbl.viewport().mapToGlobal(pos))
 
     def refresh(self):
-        if not self.engine: return
-        self.tbl.setRowCount(0)
-        for ih,h in list(self.engine.torrents.items()):
+        """Atualiza a tabela sem recriar as linhas (preserva a selecao)."""
+        if not self.engine:
+            return
+        alive = []
+        for ih, h in list(self.engine.torrents.items()):
             try:
-                if not h.is_valid(): continue
-                s=h.status()
-                if has_metadata(h):
-                    name = torrent_name(h)
-                    if ih not in self.pending or not self.pending[ih].get('report'):
-                        self.scan_pending(ih)
-                else:
-                    name = ih[:16]
-                row=self.tbl.rowCount(); self.tbl.insertRow(row)
-                it=QTableWidgetItem(name); it.setData(Qt.ItemDataRole.UserRole,ih); self.tbl.setItem(row,0,it)
-                self.tbl.setItem(row,1,QTableWidgetItem(f"{s.total_wanted/1024/1024:.1f} MB"))
-                self.tbl.setItem(row,2,QTableWidgetItem(str(s.state)))
-                self.tbl.setItem(row,3,QTableWidgetItem(f"{s.progress*100:.1f}%"))
-                self.tbl.setItem(row,4,QTableWidgetItem(f"{s.upload_rate/1024:.1f} KB/s"))
-                self.tbl.setItem(row,5,QTableWidgetItem(f"{s.download_rate/1024:.1f} KB/s"))
-            except Exception as e:
-                self.logmsg(f"Erro ao atualizar torrent {ih[:12]}: {e}")
+                if not h.is_valid():
+                    continue
+                alive.append((ih, h))
+            except Exception:
+                continue
+        alive_ih = {ih for ih, _ in alive}
+
+        # remove as linhas dos torrents que nao existem mais
+        for row in range(self.tbl.rowCount() - 1, -1, -1):
+            item = self.tbl.item(row, 0)
+            ih = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if ih not in alive_ih:
+                self.tbl.removeRow(row)
+
+        # remapeia as linhas restantes
+        self._row_map = {}
+        for row in range(self.tbl.rowCount()):
+            item = self.tbl.item(row, 0)
+            ih = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if ih:
+                self._row_map[ih] = row
+
+        for ih, h in alive:
+            row = self._row_map.get(ih)
+            if row is None:
+                row = self.tbl.rowCount()
+                self.tbl.insertRow(row)
+                self._row_map[ih] = row
+                item = QTableWidgetItem("")
+                item.setData(Qt.ItemDataRole.UserRole, ih)
+                self.tbl.setItem(row, 0, item)
+            self._update_row(row, ih, h)
+
+    def eventFilter(self, obj, event):
+        """Atalhos de teclado na tabela de torrents."""
+        if obj is self.tbl and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                self.remove_sel(False)
+                return True
+        return super().eventFilter(obj, event)
+
+    def _update_row(self, row, ih, h):
+        try:
+            s = h.status()
+            if has_metadata(h):
+                name = torrent_name(h)
+                if ih not in self.pending or not self.pending[ih].get('report'):
+                    self.scan_pending(ih)
+            else:
+                name = ih[:16]
+            # o item da coluna 0 guarda o info hash: atualiza so o texto
+            item = self.tbl.item(row, 0)
+            if item is None:
+                item = QTableWidgetItem(name)
+                item.setData(Qt.ItemDataRole.UserRole, ih)
+                self.tbl.setItem(row, 0, item)
+            else:
+                item.setText(name)
+            self._set_cell(row, 1, f"{s.total_wanted/1024/1024:.1f} MB")
+            self._set_cell(row, 2, str(s.state))
+            self._set_cell(row, 3, f"{s.progress*100:.1f}%")
+            self._set_cell(row, 4, f"{s.upload_rate/1024:.1f} KB/s")
+            self._set_cell(row, 5, f"{s.download_rate/1024:.1f} KB/s")
+            self._update_risk_cell(row, ih, item)
+        except Exception as e:
+            self.logmsg(f"Erro ao atualizar torrent {ih[:12]}: {e}")
+
+    def _update_risk_cell(self, row, ih, name_item):
+        """Mostra o risco do torrent (coluna 'Risco' + cor do nome)."""
+        level = self.risk_level(ih)
+        label = LEVEL_LABELS.get(level, level)
+        cell = self.tbl.item(row, 6)
+        if cell is None:
+            cell = QTableWidgetItem(label)
+            self.tbl.setItem(row, 6, cell)
+        elif cell.text() != label:
+            cell.setText(label)
+        cell.setForeground(QColor(LEVEL_COLORS.get(level, "#000000")))
+        if name_item is not None:
+            name_item.setForeground(QColor(LEVEL_COLORS.get(level, "#000000")))
+
+    def _set_cell(self, row, col, text):
+        item = self.tbl.item(row, col)
+        if item is None:
+            item = QTableWidgetItem(text)
+            self.tbl.setItem(row, col, item)
+        elif item.text() != text:
+            item.setText(text)
