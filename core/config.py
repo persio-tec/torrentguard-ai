@@ -36,4 +36,11 @@ class Config:
         with open(CONFIG_FILE,'w',encoding='utf-8') as f: json.dump(c,f,indent=4,ensure_ascii=False)
         return True
 
+    def get(self, section, key, default=None):
+        """Le um valor do arquivo de configuracao."""
+        try:
+            return self.data.get(section, {}).get(key, default)
+        except Exception:
+            return default
+
 cfg = Config()

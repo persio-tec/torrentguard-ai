@@ -1,16 +1,21 @@
 import os
 
+from core.lt_compat import list_files
+
 class PreDownloadScanner:
     def __init__(self):
         self.suspicious_ext = ['.exe','.msi','.bat','.cmd','.sh','.ps1','.vbs','.js','.jar','.scr','.pif','.com']
         self.piracy_keywords = ['crack','keygen','patch','activator','loader','serial','license','nulled','warez']
 
     def analyze_info(self, info):
-        files = []
-        for i in range(info.num_files()):
-            f = info.file_at(i)
-            files.append({'path': f.path, 'size': f.size})
-        return self.analyze_files(files, info.name())
+        files = [{'path': path, 'size': size}
+                 for path, size in list_files(info)]
+        name = ""
+        try:
+            name = info.name()
+        except Exception:
+            pass
+        return self.analyze_files(files, name)
 
     def analyze_files(self, files, name=""):
         report = {'risk': 'LOW', 'score': 0, 'reasons': [], 'files': files, 'blocked_ext': []}
