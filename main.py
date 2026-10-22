@@ -8,7 +8,10 @@ def main():
     app.setStyle("Fusion")
     w = MainWindow()
     w.show()
-    sys.exit(app.exec())
+    code = app.exec()
+    # garante o encerramento limpo da thread do OpenCode
+    w.close()
+    return code
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

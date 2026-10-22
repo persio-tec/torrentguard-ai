@@ -3,7 +3,7 @@ import queue
 import webbrowser
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
-                             QLineEdit, QFileDialog, QMessageBox, QHeaderView)
+                             QLineEdit, QFileDialog, QMessageBox, QHeaderView, QApplication)
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from core.engine import TorrentEngine
 from core.scanner import PreDownloadScanner
@@ -45,6 +45,18 @@ class AiWorker(QThread):
     def stop(self):
         self._stop = True
 
+    def __del__(self):
+        """Ultima linha de defesa: nao deixar a thread rodando no encerramento."""
+        try:
+            self._stop = True
+            if self.isRunning():
+                self.wait(2000)
+                if self.isRunning():
+                    self.terminate()
+                    self.wait(500)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     def run(self):
         while not self._stop:
@@ -83,6 +95,9 @@ class MainWindow(QMainWindow):
         self.ai_worker.failed.connect(self.on_ai_failed)
         self.ai_worker.started.connect(self.on_ai_started)
         self.sec = SecurityManager()
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.shutdown_worker)
         self.fw = TorrentFirewall()
         self.pending = {}
         self.setup_ui()
@@ -240,16 +255,20 @@ class MainWindow(QMainWindow):
         self.sec_ai.setText(f"Erro ao chamar OpenCode:\n{message}")
         self.logmsg(f"Erro na analise OpenCode ({name}): {message}")
 
+    def shutdown_worker(self):
+        """Encerra a thread do OpenCode (evita crash ao sair)."""
+        worker = getattr(self, "ai_worker", None)
+        if worker is None or not worker.isRunning():
+            return
+        worker.stop()
+        worker.wait(3000)
+        if worker.isRunning():
+            worker.terminate()
+            worker.wait(1000)
+
     def closeEvent(self, event):
         """Nao deixa a thread do OpenCode morrer com a janela (evita crash)."""
-        worker = getattr(self, "ai_worker", None)
-        if worker is not None and worker.isRunning():
-            self.logmsg("Encerrando, aguardando a analise com OpenCode...")
-            worker.stop()
-            worker.wait(3000)
-            if worker.isRunning():
-                worker.terminate()
-                worker.wait(1000)
+        self.shutdown_worker()
         super().closeEvent(event)
 
     def start_sel(self):
