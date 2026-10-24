@@ -91,8 +91,18 @@ class TorrentEngine:
         if info is None:
             return removed
         base = self.paths.get(ih) or ""
+        base_real = os.path.realpath(base) if base else None
         for path, _size in list_files(info):
+            # evita path traversal em nomes de arquivo maliciosos
+            if os.path.isabs(path) or ".." in path.split(os.sep):
+                continue
             full = os.path.join(base, path) if base else path
+            if base_real is not None:
+                try:
+                    if os.path.commonpath([base_real, os.path.realpath(full)]) != base_real:
+                        continue
+                except (ValueError, OSError):
+                    continue
             try:
                 if os.path.isdir(full):
                     shutil.rmtree(full, ignore_errors=True)

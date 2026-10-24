@@ -319,6 +319,9 @@ class SearchPluginsTab(QWidget):
             if resp.status_code != 200:
                 raise RuntimeError(f"HTTP {resp.status_code}")
             name = url.rstrip("/").split("/")[-1]
+            name = os.path.basename(name)
+            if not name or ".." in name:
+                raise RuntimeError("nome de arquivo invalido")
             if not name.endswith(".py"):
                 name += ".py"
             (PLUGINS_DIR / name).write_bytes(resp.content)

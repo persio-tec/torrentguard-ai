@@ -18,9 +18,12 @@ class SecurityManager:
 
     def _load_key(self):
         if KEY_FILE.exists():
+            os.chmod(KEY_FILE, 0o600)
             return KEY_FILE.read_bytes()
         key = Fernet.generate_key()
-        KEY_FILE.write_bytes(key)
+        descritor = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descritor, "wb") as arquivo:
+            arquivo.write(key)
         os.chmod(KEY_FILE, 0o600)
         return key
 
@@ -37,7 +40,7 @@ class SecurityManager:
                 for chunk in iter(lambda: f.read(8192), b''):
                     h.update(chunk)
             return h.hexdigest()
-        except:
+        except (OSError, IOError):
             return None
 
     def _init_virus_db(self):

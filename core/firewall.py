@@ -14,7 +14,7 @@ class TorrentFirewall:
                 ["iptables", "-I", "OUTPUT", "-j", "TORRENTGUARD"],
             ]
             for c in cmds:
-                subprocess.run(c, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                subprocess.run(c, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             self.enabled = True
             return True
         except Exception as e:
@@ -22,8 +22,8 @@ class TorrentFirewall:
 
     def disable(self):
         try:
-            subprocess.run(["iptables", "-F", "TORRENTGUARD"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            subprocess.run(["iptables", "-X", "TORRENTGUARD"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["iptables", "-F", "TORRENTGUARD"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            subprocess.run(["iptables", "-X", "TORRENTGUARD"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             self.enabled = False
             return True
         except:

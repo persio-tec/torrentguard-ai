@@ -29,7 +29,7 @@ class Config:
                         if isinstance(v,dict) and k in a and isinstance(a[k],dict): m(a[k],v)
                         else: a[k]=v
                 m(c,d); return c
-            except: return json.loads(json.dumps(DEFAULT))
+            except (OSError, json.JSONDecodeError): return json.loads(json.dumps(DEFAULT))
         self.save(DEFAULT); return json.loads(json.dumps(DEFAULT))
     def save(self,c=None):
         if c is None: c=self.data
